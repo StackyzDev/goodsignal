@@ -21,6 +21,8 @@
 --                                                                            --
 -- Authors:                                                                   --
 --   stravant - July 31st, 2021 - Created the file.                           --
+--   sleitnick - August 3rd, 2021 - Modified for Knit.                        --
+--   stackyz - July 23rd, 2024 - Modified for Echo.                           --
 --------------------------------------------------------------------------------
 --!nocheck
 
@@ -43,12 +45,9 @@ end
 -- Coroutine runner that we create coroutines of. The coroutine can be
 -- repeatedly resumed with functions to run followed by the argument to run
 -- them with.
-local function runEventHandlerInFreeThread()
-	-- Note: We cannot use the initial set of arguments passed to
-	-- runEventHandlerInFreeThread for a call to the handler, because those
-	-- arguments would stay on the stack for the duration of the thread's
-	-- existence, temporarily leaking references. Without access to raw bytecode
-	-- there's no way for us to clear the "..." references from the stack.
+local function runEventHandlerInFreeThread(...)
+	acquireRunnerThreadAndCallEventHandler(...)
+
 	while true do
 		acquireRunnerThreadAndCallEventHandler(coroutine.yield())
 	end
@@ -58,17 +57,12 @@ end
 local Connection = {}
 Connection.__index = Connection
 
-function Connection.new(signal, fn)
-	return setmetatable({
-		_connected = true,
-		_signal = signal,
-		_fn = fn,
-		_next = false,
-	}, Connection)
-end
-
 function Connection:Disconnect()
-	self._connected = false
+	if self.Connected == false then
+		return
+	end
+
+	self.Connected = false
 
 	-- Unhook the node, but DON'T clear it. That way any fire calls that are
 	-- currently sitting on this node will be able to iterate forwards off of
@@ -118,36 +112,86 @@ function Signal.new<T...>(): Signal<T...>
 	}, Signal) :: any
 end
 
+function Signal.Is(signal): boolean
+	return if type(signal) == "table" then getmetatable(signal) == Signal else false
+end
+
+function Signal.Wrap<T...>(signal): Signal<T...>
+	local newSignal = Signal.new()
+
+	signal:Connect(function(...)
+		newSignal:Fire(...)
+	end)
+
+	return newSignal
+end
+
 function Signal:Connect(fn)
-	local connection = Connection.new(self, fn)
+	local connection = setmetatable({
+		Connected = true,
+
+		_signal = self,
+		_fn = fn,
+		_next = false,
+		_yieldedThread = nil
+	}, Connection)
+
 	if self._handlerListHead then
 		connection._next = self._handlerListHead
 		self._handlerListHead = connection
 	else
 		self._handlerListHead = connection
 	end
+
 	return connection
 end
 
 -- Disconnect all handlers. Since we use a linked list it suffices to clear the
 -- reference to the head handler.
 function Signal:DisconnectAll()
-	self._handlerListHead = false
+	local item = self._handlerListHead
+	while item do
+		if item.Connected then
+			item.Connected = false
+			
+			local thread = item._yieldedThread
+
+			if thread and coroutine.status(thread) == "suspended" then
+				warn(debug.traceback(thread, "signal disconnected; yielded thread cancelled", 2))
+				task.cancel(thread)
+			end
+		end
+
+		item = item._next
+	end
 end
 
--- Signal:Fire(...) implemented by running the handler functions on the
--- coRunnerThread, and any time the resulting thread yielded without returning
--- to us, that means that it yielded to the Roblox scheduler and has been taken
--- over by Roblox scheduling, meaning we have to make a new coroutine runner.
 function Signal:Fire(...)
 	local item = self._handlerListHead
 	while item do
-		if item._connected then
+		task.defer(function(...)
+			if item.Connected == true then
+				item._fn(...)
+			end
+		end, ...)
+
+		item = item._next
+	end
+end
+
+-- Signal:FireImmediate(...) implemented by running the handler functions on the
+-- coRunnerThread, and any time the resulting thread yielded without returning
+-- to us, that means that it yielded to the Roblox scheduler and has been taken
+-- over by Roblox scheduling, meaning we have to make a new coroutine runner.
+function Signal:FireImmediate(...)
+	local item = self._handlerListHead
+	while item do
+		if item.Connected then
 			if not freeRunnerThread then
 				freeRunnerThread = coroutine.create(runEventHandlerInFreeThread)
 				-- Get the freeRunnerThread to the first yield
-				coroutine.resume(freeRunnerThread)
 			end
+
 			task.spawn(freeRunnerThread, item._fn, ...)
 		end
 		item = item._next
@@ -163,6 +207,7 @@ function Signal:Wait()
 		cn:Disconnect()
 		task.spawn(waitingCoroutine, ...)
 	end)
+	cn._yieldedThread = waitingCoroutine
 	return coroutine.yield()
 end
 
@@ -171,7 +216,7 @@ end
 function Signal:Once(fn)
 	local cn
 	cn = self:Connect(function(...)
-		if cn._connected then
+		if cn.Connected then
 			cn:Disconnect()
 		end
 		fn(...)
@@ -189,4 +234,8 @@ setmetatable(Signal, {
 	end,
 })
 
-return Signal
+return table.freeze({
+	new = Signal.new,
+	Is = Signal.Is,
+	Wrap = Signal.Wrap,
+})
